@@ -62,3 +62,10 @@ class Entity:
     created_by: str
     created_at: str
     updated_at: str
+
+
+# 区域人数按来源汇算：入场、现场任务带回、医疗点收治为流入，撤离为流出。
+ENTRY_SOURCES = ("admission", "bringback", "medical", "evacuation")
+ENTRY_INFLOW = ("admission", "bringback", "medical")
+ENTRY_OUTFLOW = ("evacuation", "opening")
+ENTRY_VOID_ROLES = ("coordinator",)

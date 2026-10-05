@@ -84,6 +84,22 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "headcount_entries"]:
+                    query = parse_qs(parsed.query)
+                    return self._send(
+                        200,
+                        {"items": service.list_entries(
+                            zone_id=query.get("zone_id", [None])[0],
+                            status=query.get("status", [None])[0],
+                        )},
+                    )
+                if len(parts) == 3 and parts[:2] == ["api", "headcount_entries"]:
+                    entry = service.repository.get_headcount_entry(parts[2])
+                    if not entry:
+                        raise NotFoundError("headcount entry not found: " + parts[2])
+                    return self._send(200, entry)
+                if len(parts) == 4 and parts[:2] == ["api", "zones"] and parts[3] == "headcount":
+                    return self._send(200, service.headcount(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -116,6 +132,7 @@ def create_handler(service, rules, static_dir):
                             action,
                             body.pop("data", body),
                             body.pop("expected_version", None),
+                            self.headers.get("Idempotency-Key"),
                         ),
                     )
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
@@ -131,13 +148,49 @@ def create_handler(service, rules, static_dir):
                             action,
                             body.pop("data", body),
                             body.pop("expected_version", None),
+                            self.headers.get("Idempotency-Key"),
                         ),
                     )
                 if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":
                     return self._send(
                         200,
-                        service.transition(actor, parts[2], parts[3], self._body(), None),
+                        service.transition(
+                            actor, parts[2], parts[3], self._body(), None,
+                            self.headers.get("Idempotency-Key"),
+                        ),
                     )
+                if len(parts) == 4 and parts[:2] == ["api", "headcount_entries"]:
+                    body = self._body()
+                    if parts[3] == "void":
+                        return self._send(
+                            200, service.void_entry(actor, parts[2], body.get("reason"))
+                        )
+                    if parts[3] == "update":
+                        return self._send(
+                            200,
+                            service.update_entry(
+                                actor,
+                                parts[2],
+                                body.get("quantity"),
+                                body.get("occurred_at"),
+                                body.get("reason"),
+                            ),
+                        )
+                    raise NotFoundError("not found")
+                if len(parts) == 2 and parts[1] == "headcount_entries":
+                    body = self._body()
+                    result = service.record_entry(
+                        actor,
+                        body.get("zone_id"),
+                        body.get("source_type"),
+                        body.get("source_ref"),
+                        body.get("quantity"),
+                        body.get("occurred_at"),
+                        self.headers.get("Idempotency-Key"),
+                        body.get("data"),
+                    )
+                    status = 200 if result["duplicated"] else 201
+                    return self._send(status, result["entry"])
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     return self._send(

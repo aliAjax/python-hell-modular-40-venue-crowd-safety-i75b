@@ -115,8 +115,8 @@ def _validate_zone_admit(actor, entity, data, lookup):
         limit = int(entity["data"].get("admit_limit", capacity))
         if occupancy + count > limit:
             raise ConflictError("zone admission limit would be exceeded")
+    # 人数由来源分录汇算，这里只记录放行信息。
     return {
-        "current_occupancy": occupancy + count,
         "last_admission_at": data.get("admitted_at"),
         "last_gate_id": gate["id"],
     }
@@ -144,6 +144,53 @@ def _validate_correct(actor, entity, data, lookup):
     history = list(entity["data"].get("correction_history") or [])
     history.append({"actor_id": actor.user_id, "reason": data["reason"], "from_status": entity["status"]})
     return {"correction_history": history}
+
+
+def _validate_medical_admit(actor, entity, data, lookup):
+    try:
+        count = int(data.get("count"))
+    except (TypeError, ValueError):
+        raise ValidationError("admission count must be an integer")
+    if count <= 0:
+        raise ValidationError("admission count must be positive")
+    return {"patients": int(entity["data"].get("patients", 0)) + count}
+
+
+def _validate_task_bring_back(actor, entity, data, lookup):
+    try:
+        count = int(data.get("count"))
+    except (TypeError, ValueError):
+        raise ValidationError("bring-back count must be an integer")
+    if count <= 0:
+        raise ValidationError("bring-back count must be positive")
+    return {}
+
+
+def validate_entry(actor, source_type, quantity):
+    """校验来源分录的来源类型、数量符号与操作角色。"""
+    from .domain import ENTRY_INFLOW, ENTRY_OUTFLOW, ENTRY_SOURCES
+
+    if source_type not in ENTRY_SOURCES:
+        raise ValidationError("unknown entry source: " + str(source_type))
+    try:
+        quantity = int(quantity)
+    except (TypeError, ValueError):
+        raise ValidationError("entry quantity must be an integer")
+    if source_type in ENTRY_INFLOW and quantity <= 0:
+        raise ValidationError("inflow entry quantity must be positive")
+    if source_type in ENTRY_OUTFLOW and quantity >= 0:
+        raise ValidationError("outflow entry quantity must be negative")
+    allowed = ENTRY_ROLES.get(source_type, ("operator", "supervisor", "coordinator", "admin"))
+    RuleEngine._ensure_role(actor, allowed)
+    return quantity
+
+
+ENTRY_ROLES = {
+    "admission": ("operator", "supervisor", "coordinator", "admin"),
+    "bringback": ("operator", "supervisor", "coordinator", "admin"),
+    "medical": ("operator", "supervisor", "coordinator", "admin"),
+    "evacuation": ("supervisor", "coordinator", "admin"),
+}
 
 
 class RuleEngine:
@@ -210,6 +257,11 @@ class RuleEngine:
             "cancel": (("draft", "assigned", "enroute", "on_scene"), "cancelled"),
         },
     }
+    # 不改变实体状态、只产生来源分录的操作。
+    NO_CHANGE_TRANSITIONS = {
+        ("task", "bring_back"): (("assigned", "enroute", "on_scene"),),
+        ("medical_point", "admit_patient"): (("active", "full"),),
+    }
     CREATE_REQUIRED = {
         "venue": ("name", "address"),
         "zone": ("venue_id", "name", "capacity"),
@@ -244,6 +296,8 @@ class RuleEngine:
         ("task", "arrive"): ("arrived_at",),
         ("task", "complete"): ("completed_at", "outcome"),
         ("task", "cancel"): ("reason",),
+        ("task", "bring_back"): ("count",),
+        ("medical_point", "admit_patient"): ("count",),
     }
     CREATE_ROLES = {
         "venue": ("coordinator", "admin"),
@@ -276,6 +330,8 @@ class RuleEngine:
         "arrive": ("operator", "supervisor", "admin"),
         "complete": ("operator", "supervisor", "admin"),
         "cancel": ("supervisor", "coordinator", "admin"),
+        "bring_back": ("operator", "supervisor", "admin"),
+        "admit_patient": ("operator", "supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "venue": _validate_venue,
@@ -292,6 +348,8 @@ class RuleEngine:
         ("gate", "open"): _validate_gate_open,
         ("incident", "correct"): _validate_correct,
         ("task", "assign"): _validate_task_assign,
+        ("task", "bring_back"): _validate_task_bring_back,
+        ("medical_point", "admit_patient"): _validate_medical_admit,
     }
 
     def normalize_kind(self, kind):
@@ -326,6 +384,24 @@ class RuleEngine:
 
     def validate_transition(self, actor, entity, action, data, lookup=None):
         kind = self.normalize_kind(entity["kind"])
+        no_change = self.NO_CHANGE_TRANSITIONS.get((kind, action))
+        if no_change:
+            allowed_statuses = no_change[0]
+            if entity["status"] not in allowed_statuses:
+                raise InvalidTransition(
+                    "cannot %s from status %s" % (action, entity["status"])
+                )
+            allowed_roles = self.ROLE_ACTIONS.get(
+                (kind, action), self.ROLE_ACTIONS.get(action, ("admin",))
+            )
+            self._ensure_role(actor, allowed_roles)
+            self._require(data, self.ACTION_REQUIRED.get((kind, action), ()))
+            custom = self.CUSTOM_TRANSITIONS.get((kind, action))
+            extra = custom(actor, entity, data, lookup) if custom else {}
+            patch = dict(data)
+            if extra:
+                patch.update(extra)
+            return entity["status"], patch
         transition = self.TRANSITIONS.get(kind, {}).get(action)
         if not transition:
             raise InvalidTransition("unknown action %s for %s" % (action, kind))
