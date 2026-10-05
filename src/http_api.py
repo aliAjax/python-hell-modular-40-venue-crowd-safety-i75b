@@ -84,6 +84,14 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) == 4 and parts[:2] == ["api", "zones"] and parts[3] == "entries":
+                    query = parse_qs(parsed.query)
+                    include_voided = query.get("include_voided", ["true"])[0] != "false"
+                    return self._send(
+                        200, {"items": service.list_zone_entries(parts[2], include_voided)}
+                    )
+                if len(parts) == 3 and parts[:2] == ["api", "ledger"]:
+                    return self._send(200, service.get_zone_entry(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -103,6 +111,25 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if len(parts) == 4 and parts[:2] == ["api", "zones"] and parts[3] == "entries":
+                    result = service.record_zone_entry(
+                        actor,
+                        parts[2],
+                        self._body(),
+                        self.headers.get("Idempotency-Key"),
+                    )
+                    return self._send(201 if result["created"] else 200, result)
+                if len(parts) == 4 and parts[:2] == ["api", "ledger"] and parts[3] == "actions":
+                    body = self._body()
+                    action = body.pop("action", None)
+                    if not action:
+                        raise ValidationError("action is required")
+                    return self._send(
+                        200,
+                        service.ledger_entry_action(
+                            actor, parts[2], action, body.pop("data", body)
+                        ),
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)

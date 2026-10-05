@@ -27,6 +27,33 @@ def capacity_available(capacity, occupancy, requested):
     return int(occupancy) + int(requested) <= int(capacity)
 
 
+# Zone occupancy ledger: every admission, task return, medical intake and
+# evacuation is recorded as a source entry; zone occupancy is the sum of the
+# active entries. Intake and evacuation remove people from the zone count.
+LEDGER_SOURCE_SIGNS = {
+    "admission": 1,
+    "return": 1,
+    "intake": -1,
+    "evacuation": -1,
+    "opening": 1,
+}
+LEDGER_CLIENT_SOURCES = ("admission", "return", "intake", "evacuation")
+LEDGER_RECORD_ROLES = ("operator", "supervisor", "coordinator", "admin")
+LEDGER_ADJUST_ROLES = ("operator", "supervisor", "coordinator", "admin")
+# Only the duty commander (coordinator) may void a confirmed entry.
+LEDGER_VOID_ROLES = ("coordinator", "admin")
+
+
+def _positive_int(value, field):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValidationError(field + " must be an integer")
+    if number <= 0:
+        raise ValidationError(field + " must be positive")
+    return number
+
+
 def _validate_venue(actor, data, lookup):
     if not str(data.get("name", "")).strip():
         raise ValidationError("venue name is required")
@@ -147,6 +174,12 @@ def _validate_correct(actor, entity, data, lookup):
 
 
 class RuleEngine:
+    LEDGER_SOURCE_SIGNS = LEDGER_SOURCE_SIGNS
+    LEDGER_CLIENT_SOURCES = LEDGER_CLIENT_SOURCES
+    LEDGER_RECORD_ROLES = LEDGER_RECORD_ROLES
+    LEDGER_ADJUST_ROLES = LEDGER_ADJUST_ROLES
+    LEDGER_VOID_ROLES = LEDGER_VOID_ROLES
+
     ALIASES = {
         "venues": "venue",
         "zones": "zone",
@@ -296,6 +329,75 @@ class RuleEngine:
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
+
+    @staticmethod
+    def validate_ledger_record(actor, data):
+        if actor.role not in LEDGER_RECORD_ROLES:
+            raise PermissionDenied("role %s is not allowed here" % actor.role)
+        source_type = data.get("source_type")
+        if source_type not in LEDGER_CLIENT_SOURCES:
+            raise ValidationError("unsupported source_type: " + str(source_type))
+        source_ref = str(data.get("source_ref") or "").strip()
+        if not source_ref:
+            raise ValidationError("source_ref is required")
+        count = _positive_int(data.get("count"), "count")
+        note = data.get("note")
+        return {
+            "source_type": source_type,
+            "source_ref": source_ref,
+            "quantity": LEDGER_SOURCE_SIGNS[source_type] * count,
+            "note": str(note) if note is not None else None,
+        }
+
+    @staticmethod
+    def check_ledger_zone_status(zone, source_type):
+        status = zone["status"]
+        if source_type == "admission":
+            if status == "limited":
+                raise ConflictError("zone is limited; new admissions are rejected")
+            if status != "open":
+                raise ConflictError("zone status %s does not accept admissions" % status)
+        elif status not in ("open", "limited", "evacuating"):
+            raise ConflictError("zone status %s does not accept ledger entries" % status)
+
+    @staticmethod
+    def validate_ledger_adjust(actor, data):
+        if actor.role not in LEDGER_ADJUST_ROLES:
+            raise PermissionDenied("role %s is not allowed here" % actor.role)
+        if not data.get("reason"):
+            raise ValidationError("adjust reason is required")
+        note = data.get("note")
+        return {
+            "count": _positive_int(data.get("count"), "count"),
+            "reason": data["reason"],
+            "note": str(note) if note is not None else None,
+        }
+
+    @staticmethod
+    def validate_ledger_void(actor, data):
+        if actor.role not in LEDGER_VOID_ROLES:
+            raise PermissionDenied("only the duty commander may void a ledger entry")
+        if not data.get("reason"):
+            raise ValidationError("void reason is required")
+        return {"reason": data["reason"]}
+
+    @staticmethod
+    def recalculate_zone(zone, total):
+        """Pure recalculation: fold the active ledger total into the zone.
+
+        Occupancy never goes below zero; when the total exceeds capacity an
+        open zone is switched to limited so further admissions get rejected.
+        """
+        data = dict(zone["data"])
+        capacity = int(data.get("capacity", 0))
+        data["current_occupancy"] = max(0, int(total))
+        status = zone["status"]
+        if total > capacity and status == "open":
+            status = "limited"
+            data["limit_reason"] = (
+                "ledger occupancy %d exceeds capacity %d" % (total, capacity)
+            )
+        return status, data
 
     def initial_status(self, kind):
         kind = self.normalize_kind(kind)
